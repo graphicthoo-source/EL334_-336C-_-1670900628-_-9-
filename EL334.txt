@@ -1,0 +1,461 @@
+
+#include "MK64F12.h"
+#include <stdint.h>
+
+// ================= LED PINS =================
+// All three LEDs are RED
+#define LED1 (1UL << 1)  // PTD1
+#define LED2 (1UL << 3)  // PTD3
+#define LED3 (1UL << 2)  // PTD2
+
+// ================= BUTTON PINS =================
+#define SW1 (1UL << 3)    // PTB3
+#define SW2 (1UL << 10)   // PTB10
+#define SW3 (1UL << 11)   // PTB11
+
+// ================= 7-SEGMENT PINS =================
+#define SEG_LATCH (1UL << 23) // PTB23
+#define SEG_CLOCK (1UL << 3)  // PTC3
+#define SEG_DATA  (1UL << 12) // PTC12
+
+// ================= BUZZER =================
+#define BUZZ (1U) // PTA1
+
+// ================= GAME SETTINGS =================
+#define MAX_LEVEL 5
+#define MAX_SEQUENCE 9
+
+// ================= GLOBAL VARIABLES =================
+unsigned int sequence[MAX_SEQUENCE];
+volatile unsigned int randomSeed = 0xACE1;
+volatile unsigned int timer_count = 0;
+volatile uint32_t musicMs = 0;
+volatile uint8_t toneOn = 0;
+volatile uint8_t toneLevel = 0;
+
+// ================= 7-SEGMENT DATA =================
+const unsigned char SEGMENT_MAP[10] =
+{
+    0xC0, 0xF9, 0xA4, 0xB0, 0x99,
+    0x92, 0x82, 0xF8, 0x80, 0x90
+};
+const unsigned char SEGMENT_SELECT[4] =
+{
+    0xF1, 0xF2, 0xF4, 0xF8
+};
+
+// ================= FUNCTION PROTOTYPES =================
+void GPIO_Init(void);
+void PIT_Init(void);
+void LED_Off(void);
+void LED_On(unsigned int led);
+void Delay_Short(void);
+void Delay_With_Display(unsigned int time, unsigned int level);
+void Shift_Out(unsigned char data);
+void Display_Digit(unsigned int position, unsigned int number);
+void Display_Level(unsigned int level);
+unsigned int Random_LED(void);
+void Generate_Sequence(unsigned int length);
+void Show_Sequence(unsigned int length, unsigned int level);
+unsigned int Read_Button(void);
+unsigned int Get_Player_Input(unsigned int level);
+unsigned int Check_Answer(unsigned int length, unsigned int level);
+void Buzzer_On(void);
+void Buzzer_Off(void);
+void StopTone(void);
+void StartTone(uint32_t hz);
+void Buzzer_Beep(uint32_t hz, uint32_t ms, unsigned int level);
+void Game_Over(unsigned int level);
+void Game_Win(unsigned int level);
+
+// ================= SYSTICK =================
+void SysTick_Handler(void)
+{
+    musicMs++;
+}
+uint32_t NowMs(void)
+{
+    return musicMs;
+}
+
+// ================= BUZZER CONTROL =================
+// Output LOW = Buzzer ON
+void Buzzer_On(void)
+{
+    PTA->PCOR = (1UL << BUZZ);
+    PTA->PDDR |= (1UL << BUZZ);
+}
+// Input mode = Buzzer OFF
+void Buzzer_Off(void)
+{
+    PTA->PDDR &= ~(1UL << BUZZ);
+}
+
+// ================= STOP TONE =================
+void StopTone(void)
+{
+    PIT->CHANNEL[1].TCTRL = 0U;
+    PIT->CHANNEL[1].TFLG = PIT_TFLG_TIF_MASK;
+    toneOn = 0U;
+    toneLevel = 0U;
+    Buzzer_Off();
+}
+
+// ================= START TONE =================
+void StartTone(uint32_t hz)
+{
+    uint32_t ticks;
+    StopTone();
+    if (hz == 0U)
+        return;
+    ticks = (SystemCoreClock / 2U) / (hz * 2U);
+    if (ticks < 2U)
+        ticks = 2U;
+    PIT->CHANNEL[1].LDVAL = ticks - 1U;
+    PIT->CHANNEL[1].TFLG = PIT_TFLG_TIF_MASK;
+    toneOn = 1U;
+    toneLevel = 0U;
+    Buzzer_On();
+    PIT->CHANNEL[1].TCTRL =
+        PIT_TCTRL_TIE_MASK | PIT_TCTRL_TEN_MASK;
+}
+
+// ================= PIT1 INTERRUPT =================
+void PIT1_IRQHandler(void)
+{
+    if (PIT->CHANNEL[1].TFLG & PIT_TFLG_TIF_MASK)
+    {
+        PIT->CHANNEL[1].TFLG = PIT_TFLG_TIF_MASK;
+        if (toneOn)
+        {
+            if (toneLevel)
+                Buzzer_Off();
+            else
+                Buzzer_On();
+            toneLevel ^= 1U;
+        }
+    }
+}
+
+// ================= BUZZER WITH DURATION =================
+void Buzzer_Beep(uint32_t hz, uint32_t ms, unsigned int level)
+{
+    uint32_t start;
+    if (hz == 0U || ms == 0U)
+        return;
+    start = NowMs();
+    StartTone(hz);
+    while ((uint32_t)(NowMs() - start) < ms)
+    {
+        Display_Level(level);
+    }
+    StopTone();
+}
+
+// ================= GPIO INITIALIZATION =================
+void GPIO_Init(void)
+{
+    SIM->SCGC5 |= SIM_SCGC5_PORTA_MASK |
+                  SIM_SCGC5_PORTB_MASK |
+                  SIM_SCGC5_PORTC_MASK |
+                  SIM_SCGC5_PORTD_MASK;
+
+    // LED configuration
+    PORTD->PCR[1] = PORT_PCR_MUX(1);
+    PORTD->PCR[3] = PORT_PCR_MUX(1);
+    PORTD->PCR[2] = PORT_PCR_MUX(1);
+    PTD->PDDR |= LED1 | LED2 | LED3;
+
+    // Button configuration
+    PORTB->PCR[3] =
+        PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PORTB->PCR[10] =
+        PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PORTB->PCR[11] =
+        PORT_PCR_MUX(1) | PORT_PCR_PE_MASK | PORT_PCR_PS_MASK;
+    PTB->PDDR &= ~(SW1 | SW2 | SW3);
+
+    // 7-Segment configuration
+    PORTB->PCR[23] = PORT_PCR_MUX(1);
+    PORTC->PCR[3] = PORT_PCR_MUX(1);
+    PORTC->PCR[12] = PORT_PCR_MUX(1);
+    PTB->PDDR |= SEG_LATCH;
+    PTC->PDDR |= SEG_CLOCK | SEG_DATA;
+    PTB->PCOR = SEG_LATCH;
+    PTC->PCOR = SEG_CLOCK | SEG_DATA;
+
+    // Buzzer configuration
+    PORTA->PCR[BUZZ] = PORT_PCR_MUX(1);
+    PTA->PCOR = (1UL << BUZZ);
+    PTA->PDDR &= ~(1UL << BUZZ);
+    LED_Off();
+}
+
+// ================= PIT INITIALIZATION =================
+void PIT_Init(void)
+{
+    SIM->SCGC6 |= SIM_SCGC6_PIT_MASK;
+    PIT->MCR = 0U;
+
+    // PIT Channel 0: Random timer
+    PIT->CHANNEL[0].LDVAL = 20999U;
+    PIT->CHANNEL[0].TFLG = PIT_TFLG_TIF_MASK;
+    PIT->CHANNEL[0].TCTRL = PIT_TCTRL_TIE_MASK;
+
+    // PIT Channel 1: Buzzer frequency
+    PIT->CHANNEL[1].TCTRL = 0U;
+    PIT->CHANNEL[1].TFLG = PIT_TFLG_TIF_MASK;
+    NVIC_EnableIRQ(PIT0_IRQn);
+    NVIC_EnableIRQ(PIT1_IRQn);
+    PIT->CHANNEL[0].TCTRL |= PIT_TCTRL_TEN_MASK;
+}
+
+// ================= PIT0 INTERRUPT =================
+void PIT0_IRQHandler(void)
+{
+    PIT->CHANNEL[0].TFLG = PIT_TFLG_TIF_MASK;
+    randomSeed++;
+    timer_count++;
+}
+
+// ================= DELAY =================
+void Delay_Short(void)
+{
+    volatile unsigned int i;
+    for (i = 0; i < 500; i++)
+    {
+        __NOP();
+    }
+}
+void Delay_With_Display(unsigned int time, unsigned int level)
+{
+    unsigned int i;
+    for (i = 0; i < time; i++)
+    {
+        Display_Level(level);
+    }
+}
+
+// ================= LED CONTROL =================
+void LED_Off(void)
+{
+    PTD->PSOR = LED1 | LED2 | LED3;
+}
+void LED_On(unsigned int led)
+{
+    LED_Off();
+    if (led == 1)
+        PTD->PCOR = LED1;
+    else if (led == 2)
+        PTD->PCOR = LED2;
+    else if (led == 3)
+        PTD->PCOR = LED3;
+}
+
+// ================= 7-SEGMENT =================
+void Shift_Out(unsigned char data)
+{
+    int i;
+    for (i = 7; i >= 0; i--)
+    {
+        PTC->PCOR = SEG_CLOCK;
+        if (data & (1U << i))
+            PTC->PSOR = SEG_DATA;
+        else
+            PTC->PCOR = SEG_DATA;
+        PTC->PSOR = SEG_CLOCK;
+    }
+    PTC->PCOR = SEG_CLOCK;
+}
+void Display_Digit(unsigned int position, unsigned int number)
+{
+    PTB->PCOR = SEG_LATCH;
+    Shift_Out(SEGMENT_MAP[number]);
+    Shift_Out(SEGMENT_SELECT[position]);
+    PTB->PSOR = SEG_LATCH;
+}
+void Display_Level(unsigned int level)
+{
+    Display_Digit(0, 0);
+    Delay_Short();
+    Display_Digit(1, 0);
+    Delay_Short();
+    Display_Digit(2, 0);
+    Delay_Short();
+    Display_Digit(3, level);
+    Delay_Short();
+}
+
+// ================= RANDOM LED =================
+unsigned int Random_LED(void)
+{
+    randomSeed ^= timer_count;
+    randomSeed ^= randomSeed << 7;
+    randomSeed ^= randomSeed >> 9;
+    randomSeed ^= randomSeed << 8;
+    return (randomSeed % 3U) + 1U;
+}
+void Generate_Sequence(unsigned int length)
+{
+    unsigned int i;
+    for (i = 0; i < length; i++)
+    {
+        sequence[i] = Random_LED();
+    }
+}
+
+// ================= SHOW LED SEQUENCE =================
+void Show_Sequence(unsigned int length, unsigned int level)
+{
+    unsigned int i;
+    LED_Off();
+    Delay_With_Display(200, level);
+    for (i = 0; i < length; i++)
+    {
+        LED_On(sequence[i]);
+        Delay_With_Display(400, level);
+        LED_Off();
+        Delay_With_Display(240, level);
+    }
+}
+
+// ================= BUTTON INPUT =================
+unsigned int Read_Button(void)
+{
+    unsigned int buttons;
+    buttons = PTB->PDIR;
+    if (!(buttons & SW1))
+        return 1;
+    if (!(buttons & SW2))
+        return 2;
+    if (!(buttons & SW3))
+        return 3;
+    return 0;
+}
+unsigned int Get_Player_Input(unsigned int level)
+{
+    unsigned int input;
+    while (1)
+    {
+        Display_Level(level);
+        input = Read_Button();
+        if (input != 0)
+        {
+            Delay_With_Display(2, level);
+            if (Read_Button() == input)
+            {
+                while (Read_Button() != 0)
+                {
+                    Display_Level(level);
+                }
+                Delay_With_Display(2, level);
+                return input;
+            }
+        }
+    }
+}
+
+// ================= CHECK ANSWER =================
+unsigned int Check_Answer(unsigned int length, unsigned int level)
+{
+    unsigned int i;
+    unsigned int answer;
+    for (i = 0; i < length; i++)
+    {
+        answer = Get_Player_Input(level);
+        LED_On(answer);
+        Delay_With_Display(15, level);
+        LED_Off();
+        if (answer != sequence[i])
+        {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+// ================= GAME OVER =================
+void Game_Over(unsigned int level)
+{
+    // Three sound pulses
+    Buzzer_Beep(1000U, 200U, level);
+    Delay_With_Display(100, level);
+    Buzzer_Beep(1000U, 200U, level);
+    Delay_With_Display(100, level);
+    Buzzer_Beep(1000U, 200U, level);
+
+    // All RED LEDs stay ON
+    PTD->PCOR = LED1 | LED2 | LED3;
+    while (1)
+    {
+        Display_Level(level);
+    }
+}
+
+// ================= GAME WIN =================
+void Game_Win(unsigned int level)
+{
+    // Four sound pulses with different pitches
+    Buzzer_Beep(1319U, 150U, level);
+    Delay_With_Display(50, level);
+    Buzzer_Beep(1568U, 150U, level);
+    Delay_With_Display(50, level);
+    Buzzer_Beep(1760U, 200U, level);
+    Delay_With_Display(50, level);
+    Buzzer_Beep(2093U, 300U, level);
+
+    // All RED LEDs blink
+    while (1)
+    {
+        PTD->PCOR = LED1 | LED2 | LED3;
+        Delay_With_Display(50, level);
+        LED_Off();
+        Delay_With_Display(50, level);
+    }
+}
+
+// ================= MAIN PROGRAM =================
+int main(void)
+{
+    unsigned int level;
+    unsigned int sequenceLength;
+    unsigned int result;
+
+    SystemCoreClockUpdate();
+    GPIO_Init();
+
+    // 1 millisecond system tick
+    SysTick_Config(SystemCoreClock / 1000U);
+
+    // Start PIT
+    PIT_Init();
+
+    LED_Off();
+    Buzzer_Off();
+    Delay_With_Display(100, 1);
+
+    randomSeed = timer_count ^ 0xACE1U;
+    if (randomSeed == 0U)
+        randomSeed = 0xACE1U;
+
+    // Game levels
+    for (level = 1; level <= MAX_LEVEL; level++)
+    {
+        sequenceLength = 4U + level;
+        Display_Level(level);
+        Generate_Sequence(sequenceLength);
+        Show_Sequence(sequenceLength, level);
+        result = Check_Answer(sequenceLength, level);
+        if (result == 0U)
+        {
+            Game_Over(level);
+        }
+    }
+
+    // Completed all levels
+    Game_Win(MAX_LEVEL);
+
+    while (1)
+    {
+    }
+}
